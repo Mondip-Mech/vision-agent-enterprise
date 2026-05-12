@@ -4,15 +4,24 @@ Core AI logic for Voxly.
 Public API
 ----------
 analyze_brand_voice(brand_name, platform, posts)
-    Calls NVIDIA text API to extract a structured brand voice profile from
-    real example posts. Returns a dict that is stored in SQLite and injected
-    into every subsequent caption call.
+    Calls the configured AI provider (text-only) to extract a structured brand
+    voice profile from real example posts. Returns a dict stored in SQLite and
+    injected into every subsequent caption call.
 
 generate_caption_variations(image_bytes, brand_profile, example_posts, ...)
-    Calls NVIDIA vision API with a compressed image + the brand voice profile.
-    Returns up to `num_variations` caption variations, each scored 1–10, plus
-    a one-sentence image analysis. Retries transient errors with exponential
-    backoff before surfacing to the caller.
+    Calls the configured AI provider (vision) with a compressed image and the
+    brand voice profile. Returns up to `num_variations` caption variations, each
+    scored 1–10, plus a one-sentence image analysis. Retries transient errors
+    with exponential backoff before surfacing to the caller.
+
+Provider selection
+------------------
+Set CAPTION_PROVIDER in .env to switch backends at startup (no code changes):
+    CAPTION_PROVIDER=nvidia      → NVIDIA NIM  (default, free key at build.nvidia.com)
+    CAPTION_PROVIDER=openai      → OpenAI gpt-4o
+    CAPTION_PROVIDER=anthropic   → Anthropic claude-3-5-sonnet
+
+All three providers use identical public APIs — the abstraction is internal.
 """
 from __future__ import annotations
 
@@ -308,7 +317,16 @@ def _build_variations_prompt(
     )
 
 
-# ── NVIDIA API ────────────────────────────────────────────────────────────────
+# ── Provider-agnostic API layer ───────────────────────────────────────────────
+#
+# All public functions call _post_text() or _post_vision_with_retry(), which
+# both route to _call_with_retry() → _call() → provider-specific implementation.
+#
+# Adding a new provider:
+#   1. Add its API key / model settings to config.py
+#   2. Implement _call_<provider>(messages, *, max_tokens, temperature)
+#      returning a normalised OpenAI-format dict {"choices": [...]}
+#   3. Add a branch in _call() and _require_api_key()
 
 def _post_vision_with_retry(
     image_bytes: bytes,
@@ -318,7 +336,11 @@ def _post_vision_with_retry(
     max_tokens: int,
     temperature: float,
 ) -> dict[str, Any]:
-    """Call the vision endpoint with exponential backoff retry."""
+    """Call the vision endpoint with exponential backoff retry.
+
+    Builds an OpenAI-compatible message with an image_url content block;
+    _call() converts it to the wire format expected by the active provider.
+    """
     b64      = base64.b64encode(image_bytes).decode("ascii")
     messages = [{
         "role": "user",
@@ -394,14 +416,53 @@ def _call(
     max_tokens: int,
     temperature: float,
 ) -> dict[str, Any]:
+    """Dispatch to the provider selected via CAPTION_PROVIDER."""
+    provider = settings.caption_provider
+    if provider == "openai":
+        return _call_openai_compat(
+            messages,
+            api_key=settings.openai_api_key or "",
+            base_url="https://api.openai.com/v1",
+            model=settings.openai_model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+    if provider == "anthropic":
+        return _call_anthropic(messages, max_tokens=max_tokens, temperature=temperature)
+    # Default: nvidia
+    return _call_openai_compat(
+        messages,
+        api_key=settings.nvidia_api_key or "",
+        base_url=settings.nvidia_api_base_url.rstrip("/"),
+        model=settings.nvidia_vision_model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+
+def _call_openai_compat(
+    messages: list[dict],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """
+    Call any OpenAI-compatible /chat/completions endpoint.
+
+    Used for both NVIDIA NIM and OpenAI — they share the same wire format
+    (image_url content blocks, Bearer auth, choices response).
+    """
     resp = requests.post(
-        f"{settings.nvidia_api_base_url.rstrip('/')}/chat/completions",
+        f"{base_url}/chat/completions",
         headers={
-            "Authorization": f"Bearer {settings.nvidia_api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type":  "application/json",
         },
         json={
-            "model":       settings.nvidia_vision_model,
+            "model":       model,
             "messages":    messages,
             "temperature": temperature,
             "max_tokens":  max_tokens,
@@ -411,6 +472,95 @@ def _call(
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _call_anthropic(
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """
+    Call the Anthropic Messages API and return a normalised OpenAI-format dict.
+
+    Converts OpenAI-style ``image_url`` content blocks to Anthropic's
+    ``image / source / base64`` format, then normalises the response back to
+    ``{"choices": [{"message": {"content": str, "role": "assistant"}}]}``
+    so all downstream code stays provider-agnostic.
+    """
+    anthropic_messages = _to_anthropic_messages(messages)
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key":         settings.anthropic_api_key or "",
+            "anthropic-version": "2023-06-01",
+            "Content-Type":      "application/json",
+        },
+        json={
+            "model":       settings.anthropic_model,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "messages":    anthropic_messages,
+        },
+        timeout=settings.request_timeout_seconds,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Normalise Anthropic response → OpenAI choices format
+    text_parts = [
+        block["text"]
+        for block in data.get("content", [])
+        if block.get("type") == "text"
+    ]
+    content = " ".join(text_parts)
+    return {"choices": [{"message": {"content": content, "role": "assistant"}}]}
+
+
+def _to_anthropic_messages(messages: list[dict]) -> list[dict]:
+    """
+    Convert OpenAI-format messages (including image_url blocks) to Anthropic format.
+
+    OpenAI image block:
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<b64>"}}
+
+    Anthropic image block:
+        {"type": "image", "source": {"type": "base64",
+                                     "media_type": "image/jpeg",
+                                     "data": "<b64>"}}
+    """
+    result: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            result.append({"role": msg["role"], "content": content})
+        elif isinstance(content, list):
+            blocks: list[dict] = []
+            for block in content:
+                if block.get("type") == "text":
+                    blocks.append({"type": "text", "text": block["text"]})
+                elif block.get("type") == "image_url":
+                    url = (block.get("image_url") or {}).get("url", "")
+                    if url.startswith("data:"):
+                        # data:<media_type>;base64,<data>
+                        _, rest   = url.split(":", 1)
+                        media_type, b64_data = rest.split(";base64,", 1)
+                        blocks.append({
+                            "type":   "image",
+                            "source": {
+                                "type":       "base64",
+                                "media_type": media_type,
+                                "data":       b64_data,
+                            },
+                        })
+                    else:
+                        # Remote URL — pass as-is (Anthropic supports this too)
+                        blocks.append({
+                            "type":   "image",
+                            "source": {"type": "url", "url": url},
+                        })
+            result.append({"role": msg["role"], "content": blocks})
+    return result
 
 
 def _get_content(data: dict[str, Any]) -> str:
@@ -557,8 +707,23 @@ def _compress_image(image: Image.Image) -> tuple[bytes, str]:
 # ── Guards ────────────────────────────────────────────────────────────────────
 
 def _require_api_key() -> None:
-    if not settings.nvidia_api_key:
-        raise ValueError(
-            "NVIDIA_API_KEY is not set. "
-            "Add it to your .env file (see .env.example) and restart the app."
-        )
+    """Raise ValueError if the API key for the active provider is missing."""
+    provider = settings.caption_provider
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not set. "
+                "Add it to your .env file (see .env.example) and restart the app."
+            )
+    elif provider == "anthropic":
+        if not settings.anthropic_api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY is not set. "
+                "Add it to your .env file (see .env.example) and restart the app."
+            )
+    else:  # nvidia (default)
+        if not settings.nvidia_api_key:
+            raise ValueError(
+                "NVIDIA_API_KEY is not set. "
+                "Add it to your .env file (see .env.example) and restart the app."
+            )

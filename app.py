@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 
 import pandas as pd
 import streamlit as st
@@ -447,7 +447,7 @@ with tab_gen:
                         scheduled_iso: str | None = None
                         if sched_date and sched_time:
                             scheduled_iso = datetime.combine(
-                                sched_date, sched_time, tzinfo=timezone.utc
+                                sched_date, sched_time, tzinfo=UTC
                             ).isoformat()
 
                         if platform in ("facebook", "both") and fb_text:
@@ -484,7 +484,7 @@ with tab_gen:
                                     siso = None
                                     if sched_date and sched_time:
                                         siso = datetime.combine(
-                                            sched_date, sched_time, tzinfo=timezone.utc
+                                            sched_date, sched_time, tzinfo=UTC
                                         ).isoformat()
                                     buf.publish_post(buf_token, profiles[0]["id"], full_post, siso)
                                     st.success("Posted to Buffer ✓")

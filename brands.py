@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -27,7 +27,7 @@ def save_brand(name: str, platform: str, profile: dict, example_posts: list[str]
         "platform": platform,
         "profile": profile,
         "example_posts": example_posts,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     brands.append(brand)
     _write(brands)
@@ -44,7 +44,7 @@ def update_brand(brand_id: str, name: str, platform: str, profile: dict, example
                 "platform": platform,
                 "profile": profile,
                 "example_posts": example_posts,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
             _write(brands)
             return brands[i]
