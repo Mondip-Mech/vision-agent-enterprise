@@ -1,0 +1,6 @@
+# Optional: enables semantic post retrieval (RAG) in Voxly.
+# Install alongside requirements.txt:
+#   pip install -r requirements.txt -r requirements-rag.txt
+#
+# Model used: all-MiniLM-L6-v2 (~22 MB, downloaded on first run, fully offline)
+sentence-transformers>=2.7,<5.0

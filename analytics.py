@@ -14,10 +14,11 @@ summary_stats(rows)
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 from typing import Any
 
 import database as db
-from summarizer import _get_content, _post_text
+from summarizer import _get_content, _post_text, stream_text
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,67 @@ def get_ai_insights(brand_profile: dict[str, Any]) -> str:
     result = _get_content(data)
     logger.info("AI insights generated successfully")
     return result
+
+
+def get_ai_insights_stream(
+    brand_profile: dict[str, Any],
+) -> Generator[str, None, None]:
+    """
+    Streaming version of ``get_ai_insights``.
+
+    Yields successive text chunks from the AI model so the caller can render
+    tokens in real time (e.g. ``st.write_stream()``).  Uses the same prompt
+    and data-selection logic as ``get_ai_insights``.
+
+    Args:
+        brand_profile: Voice profile dict from analyze_brand_voice().
+
+    Yields:
+        str — successive text fragments from the model.
+    """
+    rows = db.load_performance()
+
+    if len(rows) < _MIN_ROWS_FOR_INSIGHTS:
+        yield (
+            f"Add performance data for at least {_MIN_ROWS_FOR_INSIGHTS} posts "
+            "to unlock AI insights."
+        )
+        return
+
+    rows_by_likes = sorted(rows, key=lambda r: r.get("likes", 0), reverse=True)
+    half          = max(1, len(rows_by_likes) // 2)
+    sample        = min(_INSIGHT_SAMPLE_SIZE, half)
+    top           = rows_by_likes[:sample]
+    bottom        = rows_by_likes[-sample:]
+
+    def _fmt(r: dict[str, Any]) -> str:
+        preview = r["caption"][:140].replace("\n", " ")
+        return (
+            f'  Platform: {r["platform"]} | Image: {r["image_name"]}\n'
+            f'  Caption: "{preview}"\n'
+            f'  Likes: {r["likes"]} | Comments: {r["comments"]}'
+            f' | Reach: {r["reach"]} | Saves: {r["saves"]}'
+        )
+
+    top_block    = "\n\n".join(_fmt(r) for r in top)
+    bottom_block = "\n\n".join(_fmt(r) for r in bottom)
+    brand_name   = brand_profile.get("brand_name", "this brand")
+
+    prompt = (
+        f"You are a social media analyst for '{brand_name}'.\n\n"
+        f"TOP PERFORMING POSTS (highest likes):\n{top_block}\n\n"
+        f"LOWEST PERFORMING POSTS:\n{bottom_block}\n\n"
+        "Based on these real results, give exactly 3 specific, actionable "
+        "recommendations to improve future captions. Reference the actual language, "
+        "structure, or topics that worked vs. didn't. "
+        "Format as a numbered list. Each point: max 2 sentences."
+    )
+
+    logger.info(
+        "Streaming AI insights for '%s' — %d top, %d bottom posts",
+        brand_name, len(top), len(bottom),
+    )
+    yield from stream_text(prompt, max_tokens=450, temperature=0.3)
 
 
 def summary_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:

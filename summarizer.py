@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Generator
 from io import BytesIO
 from typing import Any
 
@@ -37,6 +38,7 @@ import requests
 from PIL import Image, UnidentifiedImageError
 
 from config import settings
+from rag import retrieve_relevant_posts
 
 logger = logging.getLogger(__name__)
 
@@ -258,9 +260,14 @@ def _build_variations_prompt(
     sig_words   = ", ".join(f'"{w}"' for w in (profile.get("signature_words") or []))
     cta         = profile.get("cta_style", "")
     audience    = profile.get("audience", "")
+    # Semantic retrieval: pick the most contextually relevant posts rather
+    # than blindly taking the first N.  Falls back to posts[:top_k] when
+    # sentence-transformers is not installed.
+    rag_query   = " ".join(filter(None, [brand_name, tone, context]))
+    selected    = retrieve_relevant_posts(rag_query, posts, top_k=_MAX_EXAMPLE_POSTS)
     examples    = "\n".join(
         f'  {i+1}. "{p.strip()}"'
-        for i, p in enumerate(posts[:_MAX_EXAMPLE_POSTS])
+        for i, p in enumerate(selected)
     )
     length_note   = _LENGTH_NOTES.get(length, _LENGTH_NOTES["medium"])
     hashtag_count = _HASHTAG_COUNT.get(platform, _HASHTAG_COUNT["both"])
@@ -359,6 +366,124 @@ def _post_text(prompt: str, *, max_tokens: int, temperature: float) -> dict[str,
         max_tokens=max_tokens,
         temperature=temperature,
     )
+
+
+def stream_text(
+    prompt: str,
+    *,
+    max_tokens: int = 800,
+    temperature: float = 0.4,
+) -> Generator[str, None, None]:
+    """
+    Stream a text-only response token by token from the active provider.
+
+    Yields successive text chunks as they arrive from the API, enabling
+    ``st.write_stream()`` to render tokens in real time.
+
+    Falls back to a single yielded string if the provider does not support
+    streaming or if streaming fails mid-response.
+
+    Args:
+        prompt:      The user prompt to send.
+        max_tokens:  Maximum tokens to generate.
+        temperature: Sampling temperature.
+
+    Yields:
+        str — successive text fragments from the model.
+    """
+    _require_api_key()
+    provider = settings.caption_provider
+    messages: list[dict] = [{"role": "user", "content": prompt}]
+    try:
+        if provider == "anthropic":
+            yield from _stream_anthropic(messages, max_tokens=max_tokens, temperature=temperature)
+        else:
+            api_key  = settings.openai_api_key or "" if provider == "openai" else settings.nvidia_api_key or ""
+            base_url = "https://api.openai.com/v1" if provider == "openai" else settings.nvidia_api_base_url.rstrip("/")
+            model    = settings.openai_model if provider == "openai" else settings.nvidia_vision_model
+            yield from _stream_openai_compat(
+                messages, api_key=api_key, base_url=base_url,
+                model=model, max_tokens=max_tokens, temperature=temperature,
+            )
+    except Exception as exc:
+        logger.warning("Streaming failed (%s) — falling back to batch call", exc)
+        data = _post_text(prompt, max_tokens=max_tokens, temperature=temperature)
+        yield _get_content(data)
+
+
+def _stream_openai_compat(
+    messages: list[dict],
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+) -> Generator[str, None, None]:
+    """Stream tokens from an OpenAI-compatible SSE endpoint."""
+    resp = requests.post(
+        f"{base_url}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": model, "messages": messages,  # type: ignore[dict-item]
+            "temperature": temperature, "max_tokens": max_tokens, "stream": True,
+        },
+        stream=True,
+        timeout=settings.request_timeout_seconds,
+    )
+    resp.raise_for_status()
+    for raw in resp.iter_lines():
+        if not raw or not raw.startswith(b"data: "):
+            continue
+        payload = raw[6:]
+        if payload == b"[DONE]":
+            break
+        try:
+            chunk   = json.loads(payload)
+            content = chunk["choices"][0]["delta"].get("content") or ""
+            if content:
+                yield content
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+
+def _stream_anthropic(
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> Generator[str, None, None]:
+    """Stream tokens from the Anthropic Messages SSE endpoint."""
+    anthropic_messages = _to_anthropic_messages(messages)
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": settings.anthropic_api_key or "",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": settings.anthropic_model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": anthropic_messages,  # type: ignore[dict-item]
+            "stream": True,
+        },
+        stream=True,
+        timeout=settings.request_timeout_seconds,
+    )
+    resp.raise_for_status()
+    for raw in resp.iter_lines():
+        if not raw or not raw.startswith(b"data: "):
+            continue
+        try:
+            event = json.loads(raw[6:])
+            if event.get("type") == "content_block_delta":
+                text = event.get("delta", {}).get("text") or ""
+                if text:
+                    yield text
+        except (json.JSONDecodeError, KeyError):
+            continue
 
 
 def _call_with_retry(

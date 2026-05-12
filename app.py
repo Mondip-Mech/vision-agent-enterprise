@@ -701,12 +701,16 @@ with tab_analytics:
         st.info("Add performance data for at least 3 posts to unlock AI insights.")
     else:
         if st.button("✨ Get AI Recommendations", type="primary"):
-            with st.spinner("Analyzing your top and bottom performers…"):
-                try:
-                    insight_text = analytics_store.get_ai_insights(active_for_insights["profile"])
-                    st.session_state["ai_insights"] = insight_text
-                except Exception as exc:
-                    st.error(f"Failed: {exc}")
+            try:
+                # stream_text yields tokens in real time; st.write_stream
+                # renders them as they arrive and returns the full string.
+                collected = st.write_stream(
+                    analytics_store.get_ai_insights_stream(active_for_insights["profile"])
+                )
+                st.session_state["ai_insights"] = collected
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Failed: {exc}")
 
         if st.session_state.get("ai_insights"):
             st.markdown(
