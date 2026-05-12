@@ -1,6 +1,7 @@
 # 🎙️ Voxly — Brand Voice AI Caption Generator
 
 [![CI](https://github.com/Mondip-Mech/vision-agent-enterprise/actions/workflows/ci.yml/badge.svg)](https://github.com/Mondip-Mech/vision-agent-enterprise/actions/workflows/ci.yml)
+[![Live Demo](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://vision-agent-enterprise-sd4tvbstpw5zh6rzt3qeau.streamlit.app/)
 
 > Teach Voxly your brand's voice once. It writes on-brand captions for every image, at scale.
 
