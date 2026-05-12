@@ -463,7 +463,7 @@ def _call_openai_compat(
         },
         json={
             "model":       model,
-            "messages":    messages,
+            "messages":    messages,  # type: ignore[dict-item]
             "temperature": temperature,
             "max_tokens":  max_tokens,
             "stream":      False,
@@ -500,7 +500,7 @@ def _call_anthropic(
             "model":       settings.anthropic_model,
             "max_tokens":  max_tokens,
             "temperature": temperature,
-            "messages":    anthropic_messages,
+            "messages":    anthropic_messages,  # type: ignore[dict-item]
         },
         timeout=settings.request_timeout_seconds,
     )

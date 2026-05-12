@@ -136,7 +136,9 @@ def save_brand(
             (bid, name, platform, json.dumps(profile), json.dumps(example_posts), _now()),
         )
     logger.info("Brand saved: id=%s name=%r", bid, name)
-    return get_brand(bid)
+    result = get_brand(bid)
+    assert result is not None  # row was just inserted
+    return result
 
 
 def update_brand(
@@ -154,7 +156,9 @@ def update_brand(
             (name, platform, json.dumps(profile), json.dumps(example_posts), _now(), brand_id),
         )
     logger.info("Brand updated: id=%s name=%r", brand_id, name)
-    return get_brand(brand_id)
+    result = get_brand(brand_id)
+    assert result is not None  # row was just updated
+    return result
 
 
 def delete_brand(brand_id: str) -> None:
@@ -214,7 +218,9 @@ def save_caption(
             ),
         )
     logger.debug("Caption saved: id=%s platform=%s image=%s", cid, platform, image_name)
-    return get_caption(cid)
+    result = get_caption(cid)
+    assert result is not None  # row was just inserted
+    return result
 
 
 def get_caption(caption_id: str) -> dict[str, Any] | None:
