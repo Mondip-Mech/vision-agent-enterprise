@@ -1,5 +1,7 @@
 # 🎙️ Voxly — Brand Voice AI Caption Generator
 
+[![CI](https://github.com/KaleshY/voxly/actions/workflows/ci.yml/badge.svg)](https://github.com/KaleshY/voxly/actions/workflows/ci.yml)
+
 > Teach Voxly your brand's voice once. It writes on-brand captions for every image, at scale.
 
 Voxly is a production-ready Streamlit application that combines **multimodal vision AI**, **few-shot brand voice extraction**, and **bulk caption generation** into a single workflow built for social media managers, e-commerce brands, and freelancers who produce content at scale.
@@ -46,6 +48,27 @@ generate_caption_variations()   ← NVIDIA vision model (image + text call)
 - **Single API call for 3 variations** — all variations + image analysis are generated in one call, minimising latency and cost.
 - **Structured JSON output** — model is instructed to return a strict JSON schema; a regex-based fallback parser handles malformed responses gracefully.
 - **Exponential backoff retry** — transient API timeouts and 5xx errors are retried up to 3 times before surfacing to the user.
+
+---
+
+## 🔀 Multi-Provider Support
+
+Voxly is model-agnostic. Set `CAPTION_PROVIDER` in `.env` to switch AI backends without touching any code:
+
+| `CAPTION_PROVIDER` | Model | Key variable | Notes |
+|--------------------|-------|-------------|-------|
+| `nvidia` *(default)* | `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` | `NVIDIA_API_KEY` | Free credits at build.nvidia.com |
+| `openai` | `gpt-4o` | `OPENAI_API_KEY` | Best quality; paid |
+| `anthropic` | `claude-3-5-sonnet-20241022` | `ANTHROPIC_API_KEY` | Strong reasoning + vision |
+
+Switch in one line:
+
+```env
+CAPTION_PROVIDER=openai
+OPENAI_API_KEY=sk-your-key-here
+```
+
+The provider abstraction lives entirely in `summarizer.py` — `_call()` dispatches to `_call_openai_compat()` (shared by NVIDIA and OpenAI, same wire format) or `_call_anthropic()` (message format conversion + response normalisation). All public APIs remain identical regardless of provider.
 
 ---
 
@@ -105,13 +128,18 @@ Open [http://localhost:8501](http://localhost:8501)
 
 ## 🔑 Configuration Reference
 
-All settings are read from environment variables (or `.env`). Only `NVIDIA_API_KEY` is required.
+All settings are read from environment variables (or `.env`). Only the API key for your chosen provider is required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NVIDIA_API_KEY` | — | **Required.** NVIDIA NIM API key |
+| `CAPTION_PROVIDER` | `nvidia` | AI backend — `nvidia` \| `openai` \| `anthropic` |
+| `NVIDIA_API_KEY` | — | Required when provider = `nvidia` |
+| `OPENAI_API_KEY` | — | Required when provider = `openai` |
+| `ANTHROPIC_API_KEY` | — | Required when provider = `anthropic` |
 | `NVIDIA_API_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NVIDIA API endpoint |
-| `NVIDIA_VISION_MODEL` | `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` | Vision model for caption generation |
+| `NVIDIA_VISION_MODEL` | `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` | NVIDIA vision model |
+| `OPENAI_MODEL` | `gpt-4o` | OpenAI model name |
+| `ANTHROPIC_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic model name |
 | `NVIDIA_MAX_IMAGE_BYTES` | `184320` (~180 KB) | Max compressed image size sent to API |
 | `REQUEST_TIMEOUT_SECONDS` | `60` | Per-request API timeout |
 
@@ -168,12 +196,14 @@ All settings are read from environment variables (or `.env`). Only `NVIDIA_API_K
 | Layer | Technology |
 |-------|-----------|
 | UI | Streamlit 1.37+ |
-| AI | NVIDIA NIM API (`nvidia/llama-3.1-nemotron-nano-vl-8b-v1`) |
+| AI | NVIDIA NIM · OpenAI · Anthropic (switchable via `CAPTION_PROVIDER`) |
 | Data | SQLite (via Python `sqlite3`) |
 | Image processing | Pillow |
 | Publishing | Buffer API v1 |
 | Config | `python-dotenv` |
 | Data export | `pandas` |
+| Tests | pytest + pytest-mock (92 tests) |
+| CI | GitHub Actions — lint (ruff) · type check (mypy) · tests |
 
 ---
 
