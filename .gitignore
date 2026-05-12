@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets — NEVER commit these
+.env
+*.key
+*.secret
+credentials.json
+
+# Application data — local only
+brands.json
+voxly.db
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs (all patterns the project generates)
+*.log
+*.err.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+
+# Test coverage
+.coverage
+htmlcov/

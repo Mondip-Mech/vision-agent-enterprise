@@ -1,0 +1,564 @@
+"""
+Core AI logic for Voxly.
+
+Public API
+----------
+analyze_brand_voice(brand_name, platform, posts)
+    Calls NVIDIA text API to extract a structured brand voice profile from
+    real example posts. Returns a dict that is stored in SQLite and injected
+    into every subsequent caption call.
+
+generate_caption_variations(image_bytes, brand_profile, example_posts, ...)
+    Calls NVIDIA vision API with a compressed image + the brand voice profile.
+    Returns up to `num_variations` caption variations, each scored 1–10, plus
+    a one-sentence image analysis. Retries transient errors with exponential
+    backoff before surfacing to the caller.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import re
+import time
+from io import BytesIO
+from typing import Any
+
+import requests
+from PIL import Image, UnidentifiedImageError
+
+from config import settings
+
+logger = logging.getLogger(__name__)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# Retry behaviour for transient API failures (timeouts, 5xx).
+_MAX_RETRIES: int = 3
+_RETRY_BACKOFF_BASE: float = 2.0   # wait = base^attempt → 1 s, 2 s, 4 s
+
+# Hashtag counts match platform best-practice guidelines.
+_HASHTAG_COUNT: dict[str, int] = {"instagram": 10, "facebook": 5, "both": 10}
+
+# Caption length guidance injected into the prompt.
+_LENGTH_NOTES: dict[str, str] = {
+    "short":  "Keep all captions concise — under 40 words. Punchy and direct.",
+    "medium": "Keep captions 40–80 words. Balanced detail and readability.",
+    "long":   "Write detailed captions, 80–150 words. Tell a story or include product details.",
+}
+
+# Number of real example posts to show the model (avoids prompt bloat).
+_MAX_EXAMPLE_POSTS: int = 5
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def analyze_brand_voice(
+    brand_name: str,
+    platform: str,
+    posts: list[str],
+) -> dict[str, Any]:
+    """
+    Analyse example posts and return a structured brand voice profile.
+
+    The profile captures tone, personality, style traits, emoji usage,
+    preferred emojis, sentence style, signature words, CTA style, and
+    target audience. It is stored once and reused for all caption calls.
+
+    Args:
+        brand_name: Human-readable brand or account name.
+        platform:   Target platform — "instagram", "facebook", or "both".
+        posts:      List of real posts to analyse (minimum 2, ideally 3–5).
+
+    Returns:
+        Profile dict with keys: tone, personality, style_traits, emoji_usage,
+        preferred_emojis, sentence_style, signature_words, cta_style,
+        audience, brand_name, platform.
+
+    Raises:
+        ValueError: If API key is missing, the model returns empty content,
+                    or a valid voice profile cannot be parsed.
+    """
+    _require_api_key()
+    logger.info("Analysing brand voice for '%s' from %d posts", brand_name, len(posts))
+
+    formatted = "\n\n".join(f'Post {i + 1}: "{p.strip()}"' for i, p in enumerate(posts))
+
+    prompt = (
+        f"You are analyzing the social media voice of a brand called '{brand_name}'.\n\n"
+        f"Study these {len(posts)} real posts carefully:\n\n"
+        f"{formatted}\n\n"
+        "Extract the brand voice and return ONLY a valid JSON object — no markdown, no extra text:\n"
+        "{\n"
+        '  "tone": "<2-4 word description of overall tone>",\n'
+        '  "personality": "<one sentence describing brand personality>",\n'
+        '  "style_traits": ["<trait 1>", "<trait 2>", "<trait 3>"],\n'
+        '  "emoji_usage": "<none | minimal | moderate | heavy>",\n'
+        '  "preferred_emojis": ["<emoji>", "<emoji>"],\n'
+        '  "sentence_style": "<short | medium | long>",\n'
+        '  "signature_words": ["<word/phrase>", "<word/phrase>"],\n'
+        '  "cta_style": "<how they typically end posts>",\n'
+        '  "audience": "<who they seem to be talking to>"\n'
+        "}"
+    )
+
+    data    = _post_text(prompt, max_tokens=500, temperature=0.2)
+    text    = _get_content(data)
+    profile = _parse_json(text)
+
+    if not profile or "tone" not in profile:
+        logger.warning("Failed to parse voice profile from model response")
+        raise ValueError(
+            "Could not extract a voice profile. "
+            "Add more varied example posts and try again."
+        )
+
+    profile["brand_name"] = brand_name
+    profile["platform"]   = platform
+    logger.info("Brand voice profile extracted successfully for '%s'", brand_name)
+    return profile
+
+
+def generate_caption_variations(
+    image_bytes: bytes,
+    brand_profile: dict[str, Any],
+    example_posts: list[str],
+    context: str = "",
+    num_variations: int = 3,
+    length: str = "medium",
+) -> dict[str, Any]:
+    """
+    Generate multiple caption variations for a single image.
+
+    Each variation includes Facebook and/or Instagram captions (based on the
+    brand's platform setting), a set of hashtags, a 1–10 brand-voice score,
+    and a short score reason. An image analysis sentence is also returned.
+
+    API calls are retried up to _MAX_RETRIES times with exponential backoff
+    on transient errors (timeouts, 5xx). Client errors (4xx) are not retried.
+
+    Args:
+        image_bytes:    Raw bytes of the uploaded image.
+        brand_profile:  Voice profile dict from analyze_brand_voice().
+        example_posts:  Real posts used as few-shot examples.
+        context:        Optional one-line product/campaign hint
+                        (e.g. "Winter jacket, price £89").
+        num_variations: Number of distinct caption variations to generate.
+        length:         Caption length preference — "short", "medium", or "long".
+
+    Returns:
+        {
+            "image_analysis": str,     # 1-2 sentence description of the image
+            "variations": [
+                {
+                    "facebook_caption":  str | None,
+                    "instagram_caption": str | None,
+                    "hashtags":          list[str],
+                    "score":             float,   # 1–10
+                    "score_reason":      str,
+                }
+            ],
+            "error": str | None,       # set only on failure
+        }
+    """
+    _require_api_key()
+    logger.info(
+        "Generating %d caption variation(s) for image (%d bytes), length=%s",
+        num_variations, len(image_bytes), length,
+    )
+
+    try:
+        image    = _open_image(image_bytes)
+        nv_bytes, mime = _compress_image(image)
+        platform = brand_profile.get("platform", "both")
+
+        prompt = _build_variations_prompt(
+            brand_profile, example_posts, platform,
+            context.strip(), num_variations, length,
+        )
+        data   = _post_vision_with_retry(nv_bytes, mime, prompt=prompt, max_tokens=1600, temperature=0.55)
+        text   = _get_content(data)
+
+        parsed         = _parse_json(text) or {}
+        image_analysis = parsed.get("image_analysis", "")
+        variations     = _parse_variations(parsed, platform)
+
+        if not variations:
+            # Last-resort fallback: try parsing as old single-caption format
+            old = _parse_captions(text)
+            if old.get("facebook_caption") or old.get("instagram_caption"):
+                variations = [{
+                    "facebook_caption":  old.get("facebook_caption"),
+                    "instagram_caption": old.get("instagram_caption"),
+                    "hashtags":          old.get("hashtags", []),
+                    "score":             7.0,
+                    "score_reason":      "Generated caption",
+                }]
+                logger.warning("Fell back to legacy caption parser; model may have returned non-standard JSON")
+
+        # Highest score first
+        variations.sort(key=lambda v: v.get("score", 0), reverse=True)
+
+        logger.info("Generated %d variation(s) successfully", len(variations))
+        return {"image_analysis": image_analysis, "variations": variations, "error": None}
+
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("Caption generation failed: %s", exc, exc_info=True)
+        return {"image_analysis": "", "variations": [], "error": str(exc)}
+
+
+def generate_caption(
+    image_bytes: bytes,
+    brand_profile: dict[str, Any],
+    example_posts: list[str],
+    context: str = "",
+) -> dict[str, Any]:
+    """Backwards-compatible single-caption wrapper around generate_caption_variations."""
+    result = generate_caption_variations(
+        image_bytes, brand_profile, example_posts, context=context, num_variations=1
+    )
+    if result["error"]:
+        return {"facebook_caption": None, "instagram_caption": None, "hashtags": [], "error": result["error"]}
+    best = result["variations"][0] if result["variations"] else {}
+    return {
+        "facebook_caption":  best.get("facebook_caption"),
+        "instagram_caption": best.get("instagram_caption"),
+        "hashtags":          best.get("hashtags", []),
+        "error":             None,
+    }
+
+
+# ── Prompt builder ────────────────────────────────────────────────────────────
+
+def _build_variations_prompt(
+    profile: dict[str, Any],
+    posts: list[str],
+    platform: str,
+    context: str,
+    num_variations: int,
+    length: str,
+) -> str:
+    """Build the vision-model prompt requesting `num_variations` caption variations."""
+    brand_name  = profile.get("brand_name", "this brand")
+    tone        = profile.get("tone", "")
+    personality = profile.get("personality", "")
+    traits      = ", ".join(profile.get("style_traits") or [])
+    emojis      = profile.get("emoji_usage", "")
+    fav_emojis  = " ".join(profile.get("preferred_emojis") or [])
+    sentences   = profile.get("sentence_style", "")
+    sig_words   = ", ".join(f'"{w}"' for w in (profile.get("signature_words") or []))
+    cta         = profile.get("cta_style", "")
+    audience    = profile.get("audience", "")
+    examples    = "\n".join(
+        f'  {i+1}. "{p.strip()}"'
+        for i, p in enumerate(posts[:_MAX_EXAMPLE_POSTS])
+    )
+    length_note   = _LENGTH_NOTES.get(length, _LENGTH_NOTES["medium"])
+    hashtag_count = _HASHTAG_COUNT.get(platform, _HASHTAG_COUNT["both"])
+
+    if platform == "facebook":
+        cap_schema = '"facebook_caption": "<2-3 sentence post>", "instagram_caption": null'
+    elif platform == "instagram":
+        cap_schema = '"facebook_caption": null, "instagram_caption": "<1-3 sentence caption with emojis>"'
+    else:
+        cap_schema = '"facebook_caption": "<2-3 sentence post>", "instagram_caption": "<1-3 sentence caption>"'
+
+    context_block = (
+        f"\nSPECIFIC CONTEXT: {context}\n"
+        "Use this to make captions concrete — mention the product, price, or detail if relevant.\n"
+    ) if context else ""
+
+    # JSON schema shown inline so the model has a concrete target to match.
+    schema = (
+        "{\n"
+        '  "image_analysis": "<1-2 sentence image description>",\n'
+        '  "variations": [\n'
+        "    {\n"
+        f'      {cap_schema},\n'
+        f'      "hashtags": ["#tag1", "..." ({hashtag_count} total)],\n'
+        '      "score": <1-10>,\n'
+        '      "score_reason": "<brief reason>"\n'
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
+
+    return (
+        f"You are the social media voice of '{brand_name}'.\n\n"
+        f"BRAND VOICE PROFILE:\n"
+        f"  Tone: {tone}\n"
+        f"  Personality: {personality}\n"
+        f"  Style: {traits}\n"
+        f"  Emoji Usage: {emojis} — preferred: {fav_emojis}\n"
+        f"  Sentence Length: {sentences}\n"
+        f"  Signature Words: {sig_words}\n"
+        f"  How Posts End: {cta}\n"
+        f"  Audience: {audience}\n\n"
+        f"REAL EXAMPLES (study the rhythm, language, and energy):\n"
+        f"{examples}\n"
+        f"{context_block}\n"
+        f"LENGTH: {length_note}\n\n"
+        f"Look at this image carefully and:\n"
+        f"1. Describe what you see in 1-2 sentences (product, setting, mood, colors).\n"
+        f"2. Write {num_variations} DISTINCT caption variations — different openings, angles, "
+        f"or structures — each unmistakably sounding like {brand_name}.\n"
+        f"3. Score each 1–10 for brand voice match + audience appeal.\n\n"
+        f"Return ONLY valid JSON — no markdown, no code fences:\n"
+        f"{schema}"
+    )
+
+
+# ── NVIDIA API ────────────────────────────────────────────────────────────────
+
+def _post_vision_with_retry(
+    image_bytes: bytes,
+    mime: str,
+    *,
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """Call the vision endpoint with exponential backoff retry."""
+    b64      = base64.b64encode(image_bytes).decode("ascii")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text",      "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+        ],
+    }]
+    return _call_with_retry(messages, max_tokens=max_tokens, temperature=temperature)
+
+
+def _post_text(prompt: str, *, max_tokens: int, temperature: float) -> dict[str, Any]:
+    """Call the text-only endpoint (no retry — used for brand voice extraction only)."""
+    return _call(
+        [{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+
+def _call_with_retry(
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """
+    Wrapper around _call() that retries on transient errors.
+
+    Retry policy:
+        - requests.exceptions.Timeout  → always retry (up to _MAX_RETRIES)
+        - requests.exceptions.HTTPError → retry only on 5xx; raise immediately on 4xx
+        - Wait between attempts: _RETRY_BACKOFF_BASE ^ attempt seconds (1 s, 2 s, 4 s)
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return _call(messages, max_tokens=max_tokens, temperature=temperature)
+
+        except requests.exceptions.Timeout as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "API timeout on attempt %d/%d — retrying in %.1f s",
+                    attempt + 1, _MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status < 500:
+                # 4xx is a client error — retrying won't help
+                logger.error("Non-retryable API error HTTP %d", status)
+                raise
+            last_exc = exc
+            if attempt < _MAX_RETRIES - 1:
+                wait = _RETRY_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "API HTTP %d on attempt %d/%d — retrying in %.1f s",
+                    status, attempt + 1, _MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+
+    assert last_exc is not None
+    raise last_exc
+
+
+def _call(
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    resp = requests.post(
+        f"{settings.nvidia_api_base_url.rstrip('/')}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {settings.nvidia_api_key}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "model":       settings.nvidia_vision_model,
+            "messages":    messages,
+            "temperature": temperature,
+            "max_tokens":  max_tokens,
+            "stream":      False,
+        },
+        timeout=settings.request_timeout_seconds,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError("Model returned no choices — the API response may be malformed.")
+    content = choices[0].get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = " ".join(
+            item.get("text", "")
+            for item in content
+            if item.get("type") in {"text", "output_text"}
+        )
+    if not content.strip():
+        raise ValueError("Model returned empty content.")
+    return content.strip()
+
+
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+
+def _parse_json(text: str) -> dict[str, Any] | None:
+    """
+    Try to parse a JSON dict from `text`.
+
+    Attempts (in order):
+        1. Parse the raw text directly.
+        2. Extract from a ```json ... ``` markdown code block.
+        3. Extract the first {...} block with a regex.
+    """
+    for candidate in _json_candidates(text):
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
+def _parse_variations(data: dict[str, Any], platform: str) -> list[dict[str, Any]]:
+    """Normalise the 'variations' list from the model response."""
+    raw = data.get("variations")
+    if not isinstance(raw, list):
+        return []
+
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tags = item.get("hashtags") or []
+        if isinstance(tags, str):
+            tags = tags.split()
+        try:
+            score = float(item.get("score") or 7.0)
+        except (TypeError, ValueError):
+            score = 7.0
+
+        result.append({
+            "facebook_caption":  item.get("facebook_caption") or None,
+            "instagram_caption": item.get("instagram_caption") or None,
+            "hashtags": [
+                t if t.startswith("#") else f"#{t}"
+                for t in tags if isinstance(t, str)
+            ],
+            "score":        score,
+            "score_reason": item.get("score_reason") or "",
+        })
+    return result
+
+
+def _parse_captions(text: str) -> dict[str, Any]:
+    """Legacy single-caption parser — fallback when variations parsing fails."""
+    data = _parse_json(text) or {}
+    tags = data.get("hashtags") or []
+    if isinstance(tags, str):
+        tags = tags.split()
+    return {
+        "facebook_caption":  data.get("facebook_caption") or None,
+        "instagram_caption": data.get("instagram_caption") or None,
+        "hashtags": [
+            t if t.startswith("#") else f"#{t}"
+            for t in tags if isinstance(t, str)
+        ],
+    }
+
+
+def _json_candidates(text: str) -> list[str]:
+    candidates = [text]
+    if m := re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text):
+        candidates.append(m.group(1))
+    if m := re.search(r"\{[\s\S]*\}", text):
+        candidates.append(m.group(0))
+    return candidates
+
+
+# ── Image helpers ─────────────────────────────────────────────────────────────
+
+def _open_image(image_bytes: bytes) -> Image.Image:
+    """Decode image bytes and convert to RGB, preserving original format metadata."""
+    try:
+        raw = Image.open(BytesIO(image_bytes))
+        img = raw.convert("RGB")
+        img.format = raw.format
+        return img
+    except UnidentifiedImageError as exc:
+        raise ValueError("Image could not be decoded — unsupported or corrupt file.") from exc
+
+
+def _compress_image(image: Image.Image) -> tuple[bytes, str]:
+    """
+    Resize and compress an image to fit within NVIDIA_MAX_IMAGE_BYTES.
+
+    Strategy:
+        1. Thumbnail to 1024×1024 (preserves aspect ratio).
+        2. Try JPEG quality levels 85→75→65→55→45 until size fits.
+        3. If still too large, reduce to 768×768 at quality 40.
+
+    Returns:
+        (compressed_bytes, mime_type)
+    """
+    prepared = image.copy()
+    prepared.thumbnail((1024, 1024))
+
+    for quality in (85, 75, 65, 55, 45):
+        buf = BytesIO()
+        prepared.save(buf, format="JPEG", quality=quality, optimize=True)
+        data = buf.getvalue()
+        if len(data) <= settings.nvidia_max_image_bytes:
+            logger.debug("Image compressed to %d bytes at JPEG quality %d", len(data), quality)
+            return data, "image/jpeg"
+
+    # Last resort — aggressive resize + minimum quality
+    buf = BytesIO()
+    prepared.thumbnail((768, 768))
+    prepared.save(buf, format="JPEG", quality=40, optimize=True)
+    logger.warning(
+        "Image could not be reduced below %d KB at normal quality; "
+        "used 768×768 / q40 fallback (%d bytes)",
+        settings.nvidia_max_image_bytes // 1024, len(buf.getvalue()),
+    )
+    return buf.getvalue(), "image/jpeg"
+
+
+# ── Guards ────────────────────────────────────────────────────────────────────
+
+def _require_api_key() -> None:
+    if not settings.nvidia_api_key:
+        raise ValueError(
+            "NVIDIA_API_KEY is not set. "
+            "Add it to your .env file (see .env.example) and restart the app."
+        )
