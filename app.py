@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from datetime import UTC, date, datetime
 
 import pandas as pd
@@ -11,8 +12,30 @@ import database as db
 import scheduler as buf
 from summarizer import analyze_brand_voice, generate_caption_variations
 
+logger = logging.getLogger(__name__)
+
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 db.init_db()
+
+
+@st.cache_resource
+def _preload_rag_model() -> None:
+    """
+    Download and cache the sentence-transformers model at startup.
+
+    Runs once per process; subsequent calls hit the in-process cache.
+    If sentence-transformers is not installed the call is a no-op —
+    RAG degrades gracefully to the first-N-posts fallback.
+    """
+    try:
+        from rag import _get_model  # noqa: PLC0415
+        _get_model()
+        logger.info("RAG model preloaded via st.cache_resource")
+    except Exception as exc:  # ImportError or model download failure
+        logger.debug("RAG model not preloaded: %s", exc)
+
+
+_preload_rag_model()
 
 st.set_page_config(
     page_title="Voxly",
@@ -269,6 +292,15 @@ with tab_brands:
                                     saved = db.update_brand(editing_id, brand_name.strip(), platform, profile, posts)
                                 else:
                                     saved = db.save_brand(brand_name.strip(), platform, profile, posts)
+                                # Compute and cache RAG embeddings so caption generation
+                                # never has to re-encode posts from scratch.
+                                try:
+                                    from rag import embed_posts  # noqa: PLC0415
+                                    embeddings = embed_posts(posts)
+                                    db.save_brand_embeddings(saved["id"], embeddings)
+                                    logger.info("Embeddings cached for brand '%s'", brand_name)
+                                except Exception as emb_exc:
+                                    logger.debug("Embedding cache skipped: %s", emb_exc)
                                 st.session_state.active_brand = saved
                                 st.session_state.show_brand_form = False
                                 st.session_state.editing_brand_id = None
@@ -341,6 +373,9 @@ with tab_gen:
         status = st.empty()
         total  = len(uploaded)
 
+        # Load cached embeddings once per batch (avoids re-encoding posts per image)
+        cached_emb = db.get_brand_embeddings(active["id"])
+
         for i, f in enumerate(uploaded):
             status.markdown(f"⚙️ **{f.name}** — {i + 1} of {total}")
             result = generate_caption_variations(
@@ -350,6 +385,7 @@ with tab_gen:
                 context=image_context,
                 num_variations=3,
                 length=length,
+                cached_embeddings=cached_emb,
             )
             result["filename"] = f.name
             results.append(result)

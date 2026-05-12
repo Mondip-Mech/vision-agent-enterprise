@@ -48,13 +48,14 @@ def init_db() -> None:
     with _conn() as con:
         con.executescript("""
             CREATE TABLE IF NOT EXISTS brands (
-                id           TEXT PRIMARY KEY,
-                name         TEXT NOT NULL,
-                platform     TEXT NOT NULL,
-                profile_json TEXT NOT NULL,
-                posts_json   TEXT NOT NULL,
-                created_at   TEXT NOT NULL,
-                updated_at   TEXT
+                id              TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                platform        TEXT NOT NULL,
+                profile_json    TEXT NOT NULL,
+                posts_json      TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT,
+                embeddings_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS captions (
@@ -88,6 +89,13 @@ def init_db() -> None:
                 value TEXT
             );
         """)
+    # Migrate existing databases that predate the embeddings_json column.
+    try:
+        with _conn() as con:
+            con.execute("ALTER TABLE brands ADD COLUMN embeddings_json TEXT")
+        logger.info("Migrated brands table: added embeddings_json column")
+    except Exception:
+        pass  # Column already exists — normal on all runs after the first
     logger.debug("Database initialised at %s", _DB_PATH)
 
 
@@ -173,6 +181,46 @@ def get_brand(brand_id: str) -> dict[str, Any] | None:
     with _conn() as con:
         row = con.execute("SELECT * FROM brands WHERE id = ?", (brand_id,)).fetchone()
     return _hydrate_brand(dict(row)) if row else None
+
+
+def save_brand_embeddings(brand_id: str, embeddings: list[list[float]]) -> None:
+    """
+    Persist pre-computed post embeddings for a brand.
+
+    Embeddings are stored as a JSON blob so they can be loaded without
+    re-running the sentence-transformers model on every caption generation.
+
+    Args:
+        brand_id:   UUID of the brand record.
+        embeddings: Parallel list of float vectors — one per example post.
+    """
+    with _conn() as con:
+        con.execute(
+            "UPDATE brands SET embeddings_json = ? WHERE id = ?",
+            (json.dumps(embeddings), brand_id),
+        )
+    logger.debug("Embeddings saved for brand id=%s (%d vectors)", brand_id, len(embeddings))
+
+
+def get_brand_embeddings(brand_id: str) -> list[list[float]] | None:
+    """
+    Load cached post embeddings for a brand, or None if not yet computed.
+
+    Returns:
+        List of float vectors matching the brand's example_posts order,
+        or None if embeddings have not been stored yet.
+    """
+    with _conn() as con:
+        row = con.execute(
+            "SELECT embeddings_json FROM brands WHERE id = ?", (brand_id,)
+        ).fetchone()
+    if not row or not row["embeddings_json"]:
+        return None
+    try:
+        return json.loads(row["embeddings_json"])
+    except json.JSONDecodeError:
+        logger.warning("Could not parse embeddings_json for brand id=%s", brand_id)
+        return None
 
 
 def _hydrate_brand(row: dict[str, Any]) -> dict[str, Any]:

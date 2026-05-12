@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+# Characters and patterns that must never reach the model prompt.
+_INJECT_RE = re.compile(
+    r"ignore\s+(previous|all|above)\s+instructions?|"
+    r"you\s+are\s+now\s+|"
+    r"new\s+system\s+prompt|"
+    r"<\|.*?\|>|"            # token delimiters (e.g. <|im_start|>)
+    r"\[INST\]|\[/?SYS\]",   # LLaMA / Mistral instruction tokens
+    re.IGNORECASE,
+)
+_MAX_POST_CHARS = 500   # per-post hard cap before prompt injection
+
 # Retry behaviour for transient API failures (timeouts, 5xx).
 _MAX_RETRIES: int = 3
 _RETRY_BACKOFF_BASE: float = 2.0   # wait = base^attempt → 1 s, 2 s, 4 s
@@ -60,6 +71,32 @@ _LENGTH_NOTES: dict[str, str] = {
 
 # Number of real example posts to show the model (avoids prompt bloat).
 _MAX_EXAMPLE_POSTS: int = 5
+
+
+# ── Input sanitization ───────────────────────────────────────────────────────
+
+def _sanitize_text(text: str) -> str:
+    """
+    Sanitize user-supplied text before injecting it into a model prompt.
+
+    Applies three defences in order:
+    1. Strip C0/C1 control characters (keep \\n and \\t for readability).
+    2. Hard-truncate to ``_MAX_POST_CHARS`` characters.
+    3. Replace known prompt-injection patterns with ``[removed]``.
+
+    Args:
+        text: Raw user-supplied string (brand post, context hint, etc.).
+
+    Returns:
+        Cleaned string safe for prompt interpolation.
+    """
+    # 1. Strip control characters except newline (0x0A) and tab (0x09)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # 2. Hard cap
+    text = text[:_MAX_POST_CHARS]
+    # 3. Injection patterns
+    text = _INJECT_RE.sub("[removed]", text)
+    return text.strip()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -93,7 +130,9 @@ def analyze_brand_voice(
     _require_api_key()
     logger.info("Analysing brand voice for '%s' from %d posts", brand_name, len(posts))
 
-    formatted = "\n\n".join(f'Post {i + 1}: "{p.strip()}"' for i, p in enumerate(posts))
+    formatted = "\n\n".join(
+        f'Post {i + 1}: "{_sanitize_text(p)}"' for i, p in enumerate(posts)
+    )
 
     prompt = (
         f"You are analyzing the social media voice of a brand called '{brand_name}'.\n\n"
@@ -137,6 +176,7 @@ def generate_caption_variations(
     context: str = "",
     num_variations: int = 3,
     length: str = "medium",
+    cached_embeddings: list[list[float]] | None = None,
 ) -> dict[str, Any]:
     """
     Generate multiple caption variations for a single image.
@@ -186,6 +226,7 @@ def generate_caption_variations(
         prompt = _build_variations_prompt(
             brand_profile, example_posts, platform,
             context.strip(), num_variations, length,
+            cached_embeddings=cached_embeddings,
         )
         data   = _post_vision_with_retry(nv_bytes, mime, prompt=prompt, max_tokens=1600, temperature=0.55)
         text   = _get_content(data)
@@ -248,6 +289,7 @@ def _build_variations_prompt(
     context: str,
     num_variations: int,
     length: str,
+    cached_embeddings: list[list[float]] | None = None,
 ) -> str:
     """Build the vision-model prompt requesting `num_variations` caption variations."""
     brand_name  = profile.get("brand_name", "this brand")
@@ -260,11 +302,15 @@ def _build_variations_prompt(
     sig_words   = ", ".join(f'"{w}"' for w in (profile.get("signature_words") or []))
     cta         = profile.get("cta_style", "")
     audience    = profile.get("audience", "")
-    # Semantic retrieval: pick the most contextually relevant posts rather
-    # than blindly taking the first N.  Falls back to posts[:top_k] when
-    # sentence-transformers is not installed.
-    rag_query   = " ".join(filter(None, [brand_name, tone, context]))
-    selected    = retrieve_relevant_posts(rag_query, posts, top_k=_MAX_EXAMPLE_POSTS)
+    # Semantic retrieval: pick the most contextually relevant posts.
+    # cached_embeddings avoids re-running the model on every generation call.
+    sanitized_posts = [_sanitize_text(p) for p in posts]
+    rag_query       = " ".join(filter(None, [brand_name, tone, context]))
+    selected        = retrieve_relevant_posts(
+        rag_query, sanitized_posts,
+        cached_embeddings=cached_embeddings,
+        top_k=_MAX_EXAMPLE_POSTS,
+    )
     examples    = "\n".join(
         f'  {i+1}. "{p.strip()}"'
         for i, p in enumerate(selected)
@@ -420,7 +466,12 @@ def _stream_openai_compat(
     max_tokens: int,
     temperature: float,
 ) -> Generator[str, None, None]:
-    """Stream tokens from an OpenAI-compatible SSE endpoint."""
+    """Stream tokens from an OpenAI-compatible SSE endpoint.
+
+    Raises:
+        ConnectionError: If the stream connects but yields no content tokens,
+                         which typically indicates a silent API failure.
+    """
     resp = requests.post(
         f"{base_url}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -432,6 +483,7 @@ def _stream_openai_compat(
         timeout=settings.request_timeout_seconds,
     )
     resp.raise_for_status()
+    content_received = False
     for raw in resp.iter_lines():
         if not raw or not raw.startswith(b"data: "):
             continue
@@ -442,9 +494,12 @@ def _stream_openai_compat(
             chunk   = json.loads(payload)
             content = chunk["choices"][0]["delta"].get("content") or ""
             if content:
+                content_received = True
                 yield content
         except (json.JSONDecodeError, KeyError, IndexError):
             continue
+    if not content_received:
+        raise ConnectionError("Stream connected but yielded no content — treating as transient failure")
 
 
 def _stream_anthropic(
@@ -453,7 +508,12 @@ def _stream_anthropic(
     max_tokens: int,
     temperature: float,
 ) -> Generator[str, None, None]:
-    """Stream tokens from the Anthropic Messages SSE endpoint."""
+    """Stream tokens from the Anthropic Messages SSE endpoint.
+
+    Raises:
+        ConnectionError: If the stream connects but yields no content tokens,
+                         which typically indicates a silent API failure.
+    """
     anthropic_messages = _to_anthropic_messages(messages)
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -473,6 +533,7 @@ def _stream_anthropic(
         timeout=settings.request_timeout_seconds,
     )
     resp.raise_for_status()
+    content_received = False
     for raw in resp.iter_lines():
         if not raw or not raw.startswith(b"data: "):
             continue
@@ -481,68 +542,53 @@ def _stream_anthropic(
             if event.get("type") == "content_block_delta":
                 text = event.get("delta", {}).get("text") or ""
                 if text:
+                    content_received = True
                     yield text
         except (json.JSONDecodeError, KeyError):
             continue
+    if not content_received:
+        raise ConnectionError("Stream connected but yielded no content — treating as transient failure")
 
 
-def _call_with_retry(
+# ── Provider failover helpers ─────────────────────────────────────────────────
+
+_PROVIDER_PRIORITY: tuple[str, ...] = ("nvidia", "openai", "anthropic")
+
+
+def _has_key(provider: str) -> bool:
+    """Return True if the given provider has an API key configured."""
+    if provider == "nvidia":
+        return bool(settings.nvidia_api_key)
+    if provider == "openai":
+        return bool(settings.openai_api_key)
+    if provider == "anthropic":
+        return bool(settings.anthropic_api_key)
+    return False
+
+
+def _failover_chain() -> list[str]:
+    """
+    Return the ordered list of providers to try, starting with the primary.
+
+    Only providers that have an API key configured are included.
+    This means a single-key setup has no failover; multi-key setups get
+    automatic resilience when the primary is unavailable.
+    """
+    primary = settings.caption_provider
+    return [primary] + [
+        p for p in _PROVIDER_PRIORITY
+        if p != primary and _has_key(p)
+    ]
+
+
+def _call_for_provider(
+    provider: str,
     messages: list[dict],
     *,
     max_tokens: int,
     temperature: float,
 ) -> dict[str, Any]:
-    """
-    Wrapper around _call() that retries on transient errors.
-
-    Retry policy:
-        - requests.exceptions.Timeout  → always retry (up to _MAX_RETRIES)
-        - requests.exceptions.HTTPError → retry only on 5xx; raise immediately on 4xx
-        - Wait between attempts: _RETRY_BACKOFF_BASE ^ attempt seconds (1 s, 2 s, 4 s)
-    """
-    last_exc: Exception | None = None
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            return _call(messages, max_tokens=max_tokens, temperature=temperature)
-
-        except requests.exceptions.Timeout as exc:
-            last_exc = exc
-            if attempt < _MAX_RETRIES - 1:
-                wait = _RETRY_BACKOFF_BASE ** attempt
-                logger.warning(
-                    "API timeout on attempt %d/%d — retrying in %.1f s",
-                    attempt + 1, _MAX_RETRIES, wait,
-                )
-                time.sleep(wait)
-
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            if status < 500:
-                # 4xx is a client error — retrying won't help
-                logger.error("Non-retryable API error HTTP %d", status)
-                raise
-            last_exc = exc
-            if attempt < _MAX_RETRIES - 1:
-                wait = _RETRY_BACKOFF_BASE ** attempt
-                logger.warning(
-                    "API HTTP %d on attempt %d/%d — retrying in %.1f s",
-                    status, attempt + 1, _MAX_RETRIES, wait,
-                )
-                time.sleep(wait)
-
-    assert last_exc is not None
-    raise last_exc
-
-
-def _call(
-    messages: list[dict],
-    *,
-    max_tokens: int,
-    temperature: float,
-) -> dict[str, Any]:
-    """Dispatch to the provider selected via CAPTION_PROVIDER."""
-    provider = settings.caption_provider
+    """Route a single call to the provider-specific implementation."""
     if provider == "openai":
         return _call_openai_compat(
             messages,
@@ -563,6 +609,87 @@ def _call(
         max_tokens=max_tokens,
         temperature=temperature,
     )
+
+
+def _call(
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """Single dispatch call to the configured provider — no retry or failover."""
+    return _call_for_provider(
+        settings.caption_provider, messages,
+        max_tokens=max_tokens, temperature=temperature,
+    )
+
+
+def _call_with_retry(
+    messages: list[dict],
+    *,
+    max_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """
+    Retry + automatic provider failover for transient API errors.
+
+    Retry policy per provider:
+        - Timeout      → retry up to _MAX_RETRIES with exponential backoff
+        - HTTP 5xx     → retry up to _MAX_RETRIES with exponential backoff
+        - HTTP 4xx     → raise immediately (client error, no retry/failover)
+
+    Failover:
+        When all retries for the primary provider are exhausted, the next
+        configured provider (by _PROVIDER_PRIORITY) is tried automatically.
+        Failover only happens when more than one provider has a key set.
+    """
+    chain    = _failover_chain()
+    last_exc: Exception | None = None
+
+    for p_idx, provider in enumerate(chain):
+        is_last_provider = p_idx == len(chain) - 1
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                return _call_for_provider(
+                    provider, messages,
+                    max_tokens=max_tokens, temperature=temperature,
+                )
+
+            except requests.exceptions.Timeout as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF_BASE ** attempt
+                    logger.warning(
+                        "Timeout on %s attempt %d/%d — retrying in %.1f s",
+                        provider, attempt + 1, _MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if status < 500:
+                    logger.error("Non-retryable HTTP %d from %s", status, provider)
+                    raise  # 4xx — never retry or failover
+                last_exc = exc
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF_BASE ** attempt
+                    logger.warning(
+                        "HTTP %d on %s attempt %d/%d — retrying in %.1f s",
+                        status, provider, attempt + 1, _MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+
+        # All retries for this provider exhausted
+        if not is_last_provider:
+            next_provider = chain[p_idx + 1]
+            logger.warning(
+                "Provider '%s' exhausted all %d retries — failing over to '%s'",
+                provider, _MAX_RETRIES, next_provider,
+            )
+
+    assert last_exc is not None
+    raise last_exc
 
 
 def _call_openai_compat(
